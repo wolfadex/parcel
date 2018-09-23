@@ -1,5 +1,6 @@
-const FSWatcher = require('fswatcher-child');
+const FSWatcher = require('@atom/watcher');
 const Path = require('path');
+const {EventEmitter} = require('events');
 
 /**
  * This watcher wraps chokidar so that we watch directories rather than individual files on macOS.
@@ -7,18 +8,9 @@ const Path = require('path');
  * Chokidar does not have support for watching directories on non-macOS platforms, so we disable
  * this behavior in order to prevent watching more individual files than necessary (e.g. node_modules).
  */
-class Watcher {
+class Watcher extends EventEmitter {
   constructor() {
-    // FS events on macOS are flakey in the tests, which write lots of files very quickly
-    // See https://github.com/paulmillr/chokidar/issues/612
-    this.shouldWatchDirs =
-      process.platform === 'darwin' && process.env.NODE_ENV !== 'test';
-    this.watcher = new FSWatcher({
-      useFsEvents: this.shouldWatchDirs,
-      ignoreInitial: true,
-      ignorePermissionErrors: true,
-      ignored: /\.cache|\.git/
-    });
+    super();
 
     this.watchedDirectories = new Map();
     this.stopped = false;
@@ -61,33 +53,40 @@ class Watcher {
   /**
    * Add a path to the watcher
    */
-  watch(path) {
-    if (this.shouldWatchDirs) {
-      // If there is no parent directory already watching this path, add a new watcher.
-      let parent = this.getWatchedParent(path);
-      if (!parent) {
-        // Find watchers on child directories, and remove them. They will be handled by the new parent watcher.
-        let children = this.getWatchedChildren(path);
-        let count = 1;
+  async watch(path) {
+    // If there is no parent directory already watching this path, add a new watcher.
+    let parent = this.getWatchedParent(path);
+    if (!parent) {
+      // Find watchers on child directories, and remove them. They will be handled by the new parent watcher.
+      let children = this.getWatchedChildren(path);
 
-        for (let dir of children) {
-          count += this.watchedDirectories.get(dir);
-          this.watcher._closePath(dir);
-          this.watchedDirectories.delete(dir);
-        }
-
-        let dir = Path.dirname(path);
-        this.watcher.add(dir);
-        this.watchedDirectories.set(dir, count);
-      } else {
-        // Otherwise, increment the reference count of the parent watcher.
-        this.watchedDirectories.set(
-          parent,
-          this.watchedDirectories.get(parent) + 1
-        );
+      for (let dir of children) {
+        this._unwatch(dir);
       }
-    } else {
-      this.watcher.add(path);
+
+      let dir = Path.dirname(path);
+      const watcher = await FSWatcher.watchPath(
+        dir,
+        {
+          recursive: true
+        },
+        events => {
+          console.log(events);
+        }
+      );
+
+      this.watchedDirectories.set(dir, watcher);
+    }
+  }
+
+  /**
+   * Unwatch a directory
+   */
+  _unwatch(dir) {
+    let watcher = this.watchedDirectories.get(dir);
+    if (watcher) {
+      this.watchedDirectories.delete(dir);
+      return watcher.dispose();
     }
   }
 
@@ -95,35 +94,17 @@ class Watcher {
    * Remove a path from the watcher
    */
   unwatch(path) {
-    if (this.shouldWatchDirs) {
-      let dir = this.getWatchedParent(path);
-      if (dir) {
-        // When the count of files watching a directory reaches zero, unwatch it.
-        let count = this.watchedDirectories.get(dir) - 1;
-        if (count === 0) {
-          this.watchedDirectories.delete(dir);
-          this.watcher.unwatch(dir);
-        } else {
-          this.watchedDirectories.set(dir, count);
-        }
+    let dir = this.getWatchedParent(path);
+    if (dir) {
+      // When the count of files watching a directory reaches zero, unwatch it.
+      let count = this.watchedDirectories.get(dir) - 1;
+      if (count === 0) {
+        this.watchedDirectories.delete(dir);
+        this.watcher.unwatch(dir);
+      } else {
+        this.watchedDirectories.set(dir, count);
       }
-    } else {
-      this.watcher.unwatch(path);
     }
-  }
-
-  /**
-   * Add an event handler
-   */
-  on(event, callback) {
-    this.watcher.on(event, callback);
-  }
-
-  /**
-   * Add an event handler
-   */
-  once(event, callback) {
-    this.watcher.once(event, callback);
   }
 
   /**
